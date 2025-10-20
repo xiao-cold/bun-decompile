@@ -53,6 +53,69 @@ export interface ExtractBundledFilesOptions {
   normaliseEntrypointFileName?: boolean;
 }
 
+interface ModuleGraphLayout {
+  byteCount: number;
+  modulesPtrOffset: number;
+  modulesPtrLength: number;
+  entryPointId: number;
+  structSize: number;
+  modulesStart: number;
+}
+
+const OFFSET_STRUCT_SIZES = [32, 24] as const;
+
+function readModuleGraphLayout(compiledBinaryData: DataView): ModuleGraphLayout {
+  const totalLength = compiledBinaryData.byteLength;
+  if (totalLength <= BUN_TRAILER.length + 8 + OFFSET_STRUCT_SIZES[OFFSET_STRUCT_SIZES.length - 1]) {
+    return {
+      byteCount: 0,
+      modulesPtrOffset: 0,
+      modulesPtrLength: 0,
+      entryPointId: 0,
+      structSize: OFFSET_STRUCT_SIZES[0],
+      modulesStart: 0,
+    };
+  }
+
+  for (const structSize of OFFSET_STRUCT_SIZES) {
+    const metadataOverhead = BUN_TRAILER.length + 8 + structSize;
+    if (totalLength < metadataOverhead) {
+      continue;
+    }
+
+    const offsetsStart = totalLength - metadataOverhead;
+    const byteCountBig = compiledBinaryData.getBigUint64(offsetsStart, true);
+    if (byteCountBig === 0n) {
+      continue;
+    }
+    if (byteCountBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+      continue;
+    }
+    const byteCount = Number(byteCountBig);
+
+    const modulesPtrOffset = compiledBinaryData.getUint32(offsetsStart + 8, true);
+    const modulesPtrLength = compiledBinaryData.getUint32(offsetsStart + 12, true);
+    const entryPointId = compiledBinaryData.getUint32(offsetsStart + 16, true);
+
+    const modulesStart = totalLength - (byteCount + metadataOverhead);
+    const availableBytes = totalLength - metadataOverhead;
+    if (byteCount > availableBytes || modulesPtrOffset + modulesPtrLength > byteCount) {
+      continue;
+    }
+
+    return {
+      byteCount,
+      modulesPtrOffset,
+      modulesPtrLength,
+      entryPointId,
+      structSize,
+      modulesStart,
+    };
+  }
+
+  throw new InvalidExecutableError("Invalid module graph offsets in executable");
+}
+
 export function extractBundledFiles(
   compiledBinaryData: DataView | ArrayBuffer,
   options: ExtractBundledFilesOptions = {},
@@ -68,10 +131,6 @@ export function extractBundledFiles(
 
   const decoder = new TextDecoder();
 
-  // Note: reverse engineering
-  // bun/src/StandaloneModuleGraph.zig/StandaloneModuleGraph/toBytes
-
-  // Check that the executable has the right trailer
   const trailer = decoder.decode(
     compiledBinaryData.buffer.slice(
       compiledBinaryData.byteLength - 8 - BUN_TRAILER.length,
@@ -82,39 +141,65 @@ export function extractBundledFiles(
     throw new InvalidTrailerError();
   }
 
-  const totalByteCount = compiledBinaryData.getUint32(compiledBinaryData.byteLength - 8, true);
-  if (compiledBinaryData.byteLength !== totalByteCount) {
+  const totalByteCount = compiledBinaryData.getBigUint64(
+    compiledBinaryData.byteLength - 8,
+    true,
+  );
+  if (totalByteCount !== BigInt(compiledBinaryData.byteLength)) {
     throw new TotalByteCountMismatchError();
   }
 
-  const entrypointId = compiledBinaryData.getUint32(compiledBinaryData.byteLength - 44, true);
+  const layout = readModuleGraphLayout(compiledBinaryData);
+  const { entryPointId: entrypointId, modulesPtrOffset, modulesPtrLength, modulesStart } = layout;
 
-  const modulesPtrOffset = compiledBinaryData.getUint32(compiledBinaryData.byteLength - 40, true);
-  const modulesPtrLength = compiledBinaryData.getUint32(compiledBinaryData.byteLength - 36, true);
+  const modulesData = new Uint8Array(
+    compiledBinaryData.buffer,
+    modulesStart,
+    modulesPtrOffset,
+  );
+  const validatePointer = (offset: number, length: number, label: string) => {
+    if (offset + length > modulesPtrOffset) {
+      throw new InvalidExecutableError(
+        `Invalid ${label} pointer in executable`,
+      );
+    }
+  };
 
-  const modulesStart = getModulesStart(compiledBinaryData);
-  const modulesEnd = modulesStart + modulesPtrOffset;
-  const modulesData = compiledBinaryData.buffer.slice(modulesStart, modulesEnd);
+  const slicePointer = (offset: number, length: number) =>
+    modulesData.subarray(offset, offset + length);
 
-  const modulesMetadataStart = modulesEnd;
+  const decodePointerString = (offset: number, length: number) =>
+    decoder
+      .decode(slicePointer(offset, length))
+      .replace(/\0+$/, "");
+  const modulesMetadataStart = modulesStart + modulesPtrOffset;
 
-  const payloadSize =
-    compiledBinaryData.getUint32(compiledBinaryData.byteLength - 68, true) +
-    compiledBinaryData.getUint32(compiledBinaryData.byteLength - 64, true);
-  const newFormat = payloadSize + 1 === modulesPtrOffset;
-  const modulesMetadataChunkSize = newFormat ? 28 : 32;
+  const metadataChunkCandidates = [36, 32, 28] as const;
+  const modulesMetadataChunkSize =
+    metadataChunkCandidates.find((size) => size !== 0 && modulesPtrLength % size === 0) ??
+    metadataChunkCandidates[0];
 
   const bundledFiles: BundledFile[] = [];
-  let currentOffset = 0;
-  for (let i = 0; i < modulesPtrLength / modulesMetadataChunkSize; i++) {
+  const moduleCount = Math.trunc(modulesPtrLength / modulesMetadataChunkSize);
+
+  for (let i = 0; i < moduleCount; i++) {
+    const modulesMetadataOffset = modulesMetadataStart + i * modulesMetadataChunkSize;
+    const pathOffset = compiledBinaryData.getUint32(modulesMetadataOffset, true);
+    const pathLength = compiledBinaryData.getUint32(modulesMetadataOffset + 4, true);
+    const contentsOffset = compiledBinaryData.getUint32(modulesMetadataOffset + 8, true);
+    const contentsLength = compiledBinaryData.getUint32(modulesMetadataOffset + 12, true);
+    const sourcemapOffset = compiledBinaryData.getUint32(
+      modulesMetadataOffset + 16,
+      true,
+    );
+    const sourcemapLength = compiledBinaryData.getUint32(
+      modulesMetadataOffset + 20,
+      true,
+    );
     const isEntrypoint = i === entrypointId;
 
-    const modulesMetadataOffset = modulesMetadataStart + i * modulesMetadataChunkSize;
-    const pathLength = compiledBinaryData.getUint32(modulesMetadataOffset + 4, true);
-    const contentsLength = compiledBinaryData.getUint32(modulesMetadataOffset + 12, true);
-    const sourcemapLength = compiledBinaryData.getUint32(modulesMetadataOffset + 20, true);
-
-    let path = decoder.decode(modulesData.slice(currentOffset, currentOffset + pathLength));
+    validatePointer(pathOffset, pathLength, "path");
+    let path = decodePointerString(pathOffset, pathLength);
     if (options.normaliseEntrypointFileName && isEntrypoint) {
       path = path.replace(/\/[^\/\\]+$/, "/index.js");
     }
@@ -124,48 +209,70 @@ export function extractBundledFiles(
     }
     path = removeLeadingSlash(path);
 
-    const contentsStart = currentOffset + pathLength + (newFormat ? 1 : 0);
+    validatePointer(contentsOffset, contentsLength, "contents");
+    const contentsStart = contentsOffset;
     const contentsEnd = contentsStart + contentsLength;
-    const contents = modulesData.slice(contentsStart, contentsEnd);
+    const contents = modulesData.slice(contentsStart, contentsEnd).buffer;
 
     let sourcemap: BundledFile["sourcemap"];
     if (sourcemapLength) {
+      validatePointer(sourcemapOffset, sourcemapLength, "sourcemap");
+      const sourcemapBase = sourcemapOffset;
+      const sourcemapHeaderOffset = modulesStart + sourcemapBase;
+      const headerFirstByte = compiledBinaryData.getUint8(sourcemapHeaderOffset);
+      const headerShift = headerFirstByte === 0 ? 1 : 0;
+      const headerBase = sourcemapHeaderOffset + headerShift;
+
+      const sourcemapSourcesCount = compiledBinaryData.getUint32(
+        headerBase,
+        true,
+      );
       const sourcemapMappingsLength = compiledBinaryData.getUint32(
-        modulesStart + contentsEnd + 5,
+        headerBase + 4,
         true,
       );
 
-      if (sourcemapMappingsLength) {
-        const sourcemapSourcesCount = compiledBinaryData.getUint32(
-          modulesStart + contentsEnd + 1,
-          true,
-        );
+      const pathPointerBase = headerBase + 8;
 
-        const mappingsStart = contentsEnd + 9 + sourcemapSourcesCount * 16;
+      if (sourcemapSourcesCount || sourcemapMappingsLength) {
+        const mappingsStart =
+          sourcemapBase + headerShift + 8 + sourcemapSourcesCount * 16;
         const mappingsEnd = mappingsStart + sourcemapMappingsLength;
+        if (mappingsEnd > sourcemapBase + sourcemapLength) {
+          throw new InvalidExecutableError("Invalid sourcemap data in executable");
+        }
 
-        const contentsEndData = decoder.decode(contents.slice(contents.byteLength - 49));
+        const contentsBytes = slicePointer(contentsStart, contentsLength);
+        const contentsEndSliceStart = Math.max(
+          contentsBytes.length - 49,
+          0,
+        );
+        const contentsEndData = decoder.decode(
+          contentsBytes.subarray(contentsEndSliceStart),
+        );
         const debugId = contentsEndData.match(/^\/\/# debugId=([a-fA-F0-9-]{12,})$/m)?.[1];
-        // RegEx copied from the sourcemaps debug-id spec:
-        // https://github.com/tc39/source-map/blob/main/proposals/debug-id.md#appendix-a-self-description-of-source-maps-and-javascript-files
 
         sourcemap = {
           version: 3,
           file: path,
           debugId,
-          mappings: decoder.decode(modulesData.slice(mappingsStart, mappingsEnd)),
+          mappings: decoder.decode(
+            slicePointer(mappingsStart, sourcemapMappingsLength),
+          ),
           sources: [],
         };
 
         let sourceStart = mappingsEnd;
         for (let j = 0; j < sourcemapSourcesCount; j++) {
           const sourcemapSourceLength = compiledBinaryData.getUint32(
-            modulesStart + contentsEnd + 13 + j * 8,
+            pathPointerBase + j * 8 + 4,
             true,
           );
 
+          validatePointer(sourceStart, sourcemapSourceLength, "sourcemap source");
+
           sourcemap.sources.push(
-            decoder.decode(modulesData.slice(sourceStart, sourceStart + sourcemapSourceLength)),
+            decodePointerString(sourceStart, sourcemapSourceLength),
           );
 
           sourceStart += sourcemapSourceLength;
@@ -173,27 +280,31 @@ export function extractBundledFiles(
       }
     }
 
-    const bundledFile: BundledFile = { path, contents, sourcemap };
+    const bundledFile: BundledFile = {
+      path,
+      contents,
+      sourcemap,
+    };
+
     if (isEntrypoint) {
       bundledFiles.unshift(bundledFile);
     } else {
       bundledFiles.push(bundledFile);
     }
-
-    currentOffset += pathLength + contentsLength + sourcemapLength + (newFormat ? 2 : 0);
   }
 
   return bundledFiles;
 }
 
 function getModulesStart(compiledBinaryData: DataView) {
-  if (compiledBinaryData.byteLength <= 48) {
-    return 0;
+  try {
+    return readModuleGraphLayout(compiledBinaryData).modulesStart;
+  } catch (e) {
+    if (e instanceof InvalidExecutableError) {
+      return compiledBinaryData.byteLength;
+    }
+    throw e;
   }
-
-  const offsetByteCount = compiledBinaryData.getUint32(compiledBinaryData.byteLength - 48, true);
-
-  return compiledBinaryData.byteLength - (offsetByteCount + 48);
 }
 
 function removeBunfsRootFromPath(path: string) {
